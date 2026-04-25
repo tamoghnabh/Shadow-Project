@@ -1,6 +1,81 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import os
+
+def load_and_operate(folder_path, start_year, end_year, cellID, month = None, print_missing=False, operation=None):
+    results = {}
+    """Load CSV files for a given cell and year range, apply an optional operation, and return results.
+    Parameters:
+    - folder_path: str, path to the folder containing CSV files
+    - start_year: int, starting year (inclusive)
+    - end_year: int, ending year (inclusive)
+    - cellID: str, cell ID to filter files (e.g., '06')
+    - month: int or None, if specified, only load files for this month (1-12)
+    - print_missing: bool, if True, print names of missing files
+    - operation: function or None, if provided, apply this function to each loaded DataFrame
+    Returns:
+    - dict, keys are 'YYYY_MM' or 'YYYY' (if month is None), values are results of the operation or the DataFrame itself if operation is None
+    """
+    for year in range(start_year, end_year + 1):
+        if month is not None:
+            file_name = f"{year}_{month:02d}_System_ID_{cellID}.csv"
+            file_path = os.path.join(folder_path, file_name)
+
+            try:
+                df = pd.read_csv(file_path)
+                
+                df = process_time(df)
+                
+                if operation:
+                    result = operation(df)
+                    results = result
+
+                # print(f"Loaded: {file_name}")
+
+            except FileNotFoundError:
+                if print_missing:
+                    print(f"Missing: {file_name}")
+                    continue
+
+            except Exception as e:
+                print(f"Error reading {file_name}: {e}")
+                continue
+        else:
+            for month in range(1, 13):
+                file_name = f"{year}_{month:02d}_System_ID_{cellID}.csv"
+                file_path = os.path.join(folder_path, file_name)
+
+                try:
+                    df = pd.read_csv(file_path)
+                    
+                    df = process_time(df)
+                    
+                    if operation:
+                        result = operation(df)
+                        results[f"{year}_{month:02d}"] = result
+
+                    # print(f"Loaded: {file_name}")
+
+                except FileNotFoundError:
+                    if print_missing:
+                        print(f"Missing: {file_name}")
+                        continue
+
+                except Exception as e:
+                    print(f"Error reading {file_name}: {e}")
+                    continue
+
+    return results
+
+def process_time(df):
+    df['Time'] = pd.to_datetime(df['Time'])
+    timegap = (df['Time'] - df['Time'].iloc[0])
+    seconds = timegap.apply(lambda x: pd.Timedelta(x).total_seconds())
+    df['Seconds'] = seconds
+    return df
+
 
 def plot_multi_axis(df, column_map, legend_names, figsize=(12, 7), x=None, color_cycle=None):
     """
@@ -93,144 +168,18 @@ def plot_multi_axis(df, column_map, legend_names, figsize=(12, 7), x=None, color
 
     return fig, axes
 
+def cell_level_scaling(df, metadata, cell_id):
+    cell = metadata[metadata['ID'] == cell_id].reset_index(drop=True)
+    n_s = cell['Cell_number_in_series'].iloc[0]
+    n_p = cell['Cell_number_in_parallel'].iloc[0]
+    df['V_cell_in_V'] = df['V_in_V'] / n_s
+    df['I_cell_in_A'] = df['I_in_A'] / n_p
+    return df
 
-def cell_level_scaling(systems_metadata, cell_id):
+def cell_level_info(systems_metadata, cell_id):
     cell = systems_metadata[systems_metadata['ID'] == cell_id].reset_index(drop=True)
     n_s = cell['Cell_number_in_series'].iloc[0]
     n_p = cell['Cell_number_in_parallel'].iloc[0]
     V_nom = cell['Voltage_nominal_in_V'].iloc[0] / n_s
     Cell_ah = cell['Capacity_nominal_in_Ah'].iloc[0] / n_p
     return V_nom, Cell_ah
-
-
-def detect_relaxation_after_throughput(
-    seconds,
-    current,
-    voltage,
-    capacity_ah,
-    c_rate_threshold=0.02,          # ~C/50
-    peak_current_threshold=None,
-    peak_duration_threshold=10.0,   # seconds
-    min_duration=120.0,             # seconds
-    min_throughput_soc=0.2          # 20% SOC
-):
-    """
-    Returns:
-        charge_relaxations: [(start_time, end_time), ...]
-        discharge_relaxations: [(start_time, end_time), ...]
-    """
-
-    seconds = np.asarray(seconds)
-    current = np.asarray(current)
-    voltage = np.asarray(voltage)
-
-    dt = np.diff(seconds, prepend=seconds[0])
-
-    # -----------------------------
-    # 1. THROUGHPUT SEGMENTATION
-    # -----------------------------
-    charge_segments = []
-    discharge_segments = []
-
-    seg_start = 0
-    cumulative_ah = 0.0
-
-    def finalize_segment(start, end, total_ah):
-        soc = abs(total_ah) / capacity_ah
-        if soc >= min_throughput_soc:
-            if total_ah > 0:
-                charge_segments.append((start, end))
-            else:
-                discharge_segments.append((start, end))
-
-    for i in range(1, len(seconds)):
-        cumulative_ah += current[i] * dt[i] / 3600.0
-
-        # Detect sign change → end of event
-        if np.sign(current[i]) != np.sign(current[i-1]):
-            finalize_segment(seg_start, i-1, cumulative_ah)
-            seg_start = i
-            cumulative_ah = 0.0
-
-    # finalize last segment
-    finalize_segment(seg_start, len(seconds)-1, cumulative_ah)
-
-    # -----------------------------
-    # Helper: apply remaining filters
-    # -----------------------------
-    def process_segment(s, e):
-        seg_time = seconds[s:e+1]
-        seg_current = current[s:e+1]
-
-        # --- CURRENT FILTER ---
-        current_threshold = c_rate_threshold * capacity_ah
-        relax_mask = np.abs(seg_current) < current_threshold
-
-        # find subsegments
-        subsegments = []
-        start = None
-        for i, val in enumerate(relax_mask):
-            if val and start is None:
-                start = i
-            elif not val and start is not None:
-                subsegments.append((start, i-1))
-                start = None
-        if start is not None:
-            subsegments.append((start, len(relax_mask)-1))
-
-        # --- PEAK FILTER ---
-        if peak_current_threshold is None:
-            peak_thr = current_threshold * 3
-        else:
-            peak_thr = peak_current_threshold
-
-        peak_filtered = []
-        for (ss, ee) in subsegments:
-            sub_i = np.abs(seg_current[ss:ee+1])
-            sub_t = seg_time[ss:ee+1]
-
-            peak_mask = sub_i > peak_thr
-
-            peak_start = None
-            reject = False
-
-            for k, val in enumerate(peak_mask):
-                if val and peak_start is None:
-                    peak_start = k
-                elif not val and peak_start is not None:
-                    duration = sub_t[k-1] - sub_t[peak_start]
-                    if duration >= peak_duration_threshold:
-                        reject = True
-                        break
-                    peak_start = None
-
-            if peak_start is not None:
-                duration = sub_t[-1] - sub_t[peak_start]
-                if duration >= peak_duration_threshold:
-                    reject = True
-
-            if not reject:
-                peak_filtered.append((ss, ee))
-
-        # --- DURATION FILTER ---
-        final = []
-        for (ss, ee) in peak_filtered:
-            duration = seg_time[ee] - seg_time[ss]
-            if duration >= min_duration:
-                final.append((seconds[s + ss], seconds[s + ee]))
-
-        return final
-
-    # -----------------------------
-    # 2–4. Apply filters per segment
-    # -----------------------------
-    charge_relaxations = []
-    discharge_relaxations = []
-
-    for (s, e) in charge_segments:
-        charge_relaxations.extend(process_segment(s, e))
-
-    for (s, e) in discharge_segments:
-        discharge_relaxations.extend(process_segment(s, e))
-
-    return charge_relaxations, discharge_relaxations
