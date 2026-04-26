@@ -204,15 +204,17 @@ def coulomb_count_bidirectional(
 
     return soc
 
-import numpy as np
-import pandas as pd
+def vmax_vmin(df):
+    max_V = df['V_cell_in_V'].max()
+    min_V = df['V_cell_in_V'].min()
+    max_V_time = df[df['V_cell_in_V'] == max_V]['Seconds'].iloc[0]
+    min_V_time = df[df['V_cell_in_V'] == min_V]['Seconds'].iloc[0]
+    return max_V, min_V, max_V_time, min_V_time
 
 def compute_ah_throughput(
     df,
-    start_time,
-    end_time,
-    time_col="time",
-    current_col="current",
+    time_col="Seconds",
+    current_col="I_cell_in_A",
     method="trapezoidal"
 ):
     """
@@ -238,16 +240,22 @@ def compute_ah_throughput(
 
     # Sort just in case
     df = df.sort_values(time_col)
-
+    
+    _, _, start_time, end_time = vmax_vmin(df)
     # Filter time window
-    mask = (df[time_col] >= start_time) & (df[time_col] <= end_time)
+    # Detect direction
+    reverse = end_time < start_time
+
+    t1, t2 = (end_time, start_time) if reverse else (start_time, end_time)
+
+    mask = (df[time_col] >= t1) & (df[time_col] <= t2)
     sub_df = df.loc[mask]
 
     if len(sub_df) < 2:
         raise ValueError("Not enough data points in the selected interval")
 
     t = sub_df[time_col].values
-    i = np.abs(sub_df[current_col].values)  # throughput uses absolute current
+    i = sub_df[current_col].values
 
     # Compute dt
     dt = np.diff(t)
@@ -263,4 +271,4 @@ def compute_ah_throughput(
     else:
         raise ValueError("method must be 'trapezoidal' or 'rectangular'")
 
-    return ah
+    return np.abs(ah)
