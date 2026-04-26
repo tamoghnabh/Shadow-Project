@@ -203,3 +203,64 @@ def coulomb_count_bidirectional(
         soc = np.clip(soc, 0.0, 1.0)
 
     return soc
+
+import numpy as np
+import pandas as pd
+
+def compute_ah_throughput(
+    df,
+    start_time,
+    end_time,
+    time_col="time",
+    current_col="current",
+    method="trapezoidal"
+):
+    """
+    Compute cumulative Ah throughput between two timestamps.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain time and current columns
+    start_time : float or datetime-like
+    end_time : float or datetime-like
+    time_col : str
+        Name of time column
+    current_col : str
+        Name of current column (A)
+    method : str
+        'trapezoidal' (recommended) or 'rectangular'
+
+    Returns
+    -------
+    throughput_ah : float
+    """
+
+    # Sort just in case
+    df = df.sort_values(time_col)
+
+    # Filter time window
+    mask = (df[time_col] >= start_time) & (df[time_col] <= end_time)
+    sub_df = df.loc[mask]
+
+    if len(sub_df) < 2:
+        raise ValueError("Not enough data points in the selected interval")
+
+    t = sub_df[time_col].values
+    i = np.abs(sub_df[current_col].values)  # throughput uses absolute current
+
+    # Compute dt
+    dt = np.diff(t)
+
+    if method == "rectangular":
+        # Left Riemann sum
+        ah = np.sum(i[:-1] * dt) / 3600.0
+
+    elif method == "trapezoidal":
+        # Better accuracy
+        ah = np.sum(0.5 * (i[:-1] + i[1:]) * dt) / 3600.0
+
+    else:
+        raise ValueError("method must be 'trapezoidal' or 'rectangular'")
+
+    return ah
