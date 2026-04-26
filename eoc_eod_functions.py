@@ -18,15 +18,17 @@ def load_and_operate(folder_path, start_year, end_year, cellID, month = None, pr
     Returns:
     - dict, keys are 'YYYY_MM' or 'YYYY' (if month is None), values are results of the operation or the DataFrame itself if operation is None
     """
+    systems_md = pd.read_excel('/home/tamoghna/Matlab/Mehran_stuff/Metadata_and_Code/00_Data/00_Metadata/Metadata_Systems.xlsx')
     for year in range(start_year, end_year + 1):
         if month is not None:
-            file_name = f"{year}_{month:02d}_System_ID_{cellID}.csv"
+            file_name = f"{year}_{month:02d}_System_ID_{cellID:02d}.csv"
             file_path = os.path.join(folder_path, file_name)
 
             try:
                 df = pd.read_csv(file_path)
                 
                 df = process_time(df)
+                df = cell_level_scaling(df, systems_md, cell_id=int(cellID))
                 
                 if operation:
                     result = operation(df)
@@ -44,14 +46,14 @@ def load_and_operate(folder_path, start_year, end_year, cellID, month = None, pr
                 continue
         else:
             for month in range(1, 13):
-                file_name = f"{year}_{month:02d}_System_ID_{cellID}.csv"
+                file_name = f"{year}_{month:02d}_System_ID_{cellID:02d}.csv"
                 file_path = os.path.join(folder_path, file_name)
 
                 try:
                     df = pd.read_csv(file_path)
                     
                     df = process_time(df)
-                    
+                    df = cell_level_scaling(df, systems_md, cell_id=int(cellID))
                     if operation:
                         result = operation(df)
                         results[f"{year}_{month:02d}"] = result
@@ -183,3 +185,35 @@ def cell_level_info(systems_metadata, cell_id):
     V_nom = cell['Voltage_nominal_in_V'].iloc[0] / n_s
     Cell_ah = cell['Capacity_nominal_in_Ah'].iloc[0] / n_p
     return V_nom, Cell_ah
+
+def dict_to_df(data_dict, columns=None, index_name='key'):
+    """Convert a dict of values to a DataFrame.
+
+    Parameters
+    ----------
+    data_dict : dict
+        Mapping from key to values (tuple or dict).
+    columns : list[str] | None
+        Optional column names. If None, uses dict keys or auto-generates names.
+    index_name : str
+        Name for the index column. Default is 'key'.
+
+    Returns
+    -------
+    pd.DataFrame
+        Rows are the dict keys and columns are the values.
+    """
+    if len(data_dict) == 0:
+        return pd.DataFrame(columns=columns)
+
+    first_value = next(iter(data_dict.values()))
+    
+    if isinstance(first_value, dict):
+        df = pd.DataFrame.from_dict(data_dict, orient='index')
+        if columns is not None and list(df.columns) != columns:
+            df = df.reindex(columns=columns)
+    else:
+        df = pd.DataFrame.from_dict(data_dict, orient='index', columns=columns)
+
+    df.index.name = index_name
+    return df

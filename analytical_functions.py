@@ -8,7 +8,12 @@ def detect_relaxation_after_throughput(
     peak_current_threshold=None,
     peak_duration_threshold=10.0,   # seconds
     min_duration=120.0,             # seconds
-    min_throughput_soc=0.2          # 20% SOC
+    min_throughput_soc=0.2,          # 20% SOC
+    # ---- Filter toggles ----
+    apply_throughput_filter=True,
+    apply_current_filter=True,
+    apply_peak_filter=True,
+    apply_duration_filter=True,
 ):
     """
     Detect relaxation periods after significant charge/discharge events.
@@ -34,28 +39,34 @@ def detect_relaxation_after_throughput(
     charge_segments = []
     discharge_segments = []
 
-    seg_start = 0
-    cumulative_ah = 0.0
+    if apply_throughput_filter:
 
-    def finalize_segment(start, end, total_ah):
-        soc = abs(total_ah) / capacity_ah
-        if soc >= min_throughput_soc:
-            if total_ah > 0:
-                charge_segments.append((start, end))
-            else:
-                discharge_segments.append((start, end))
+        seg_start = 0
+        cumulative_ah = 0.0
 
-    for i in range(1, len(seconds)):
-        cumulative_ah += current[i] * dt[i] / 3600.0
+        def finalize_segment(start, end, total_ah):
+            soc = abs(total_ah) / capacity_ah
+            if soc >= min_throughput_soc:
+                if total_ah > 0:
+                    charge_segments.append((start, end))
+                else:
+                    discharge_segments.append((start, end))
 
-        # Detect sign change → end of event
-        if np.sign(current[i]) != np.sign(current[i-1]):
-            finalize_segment(seg_start, i-1, cumulative_ah)
-            seg_start = i
-            cumulative_ah = 0.0
+        for i in range(1, len(seconds)):
+            cumulative_ah += current[i] * dt[i] / 3600.0
 
-    # finalize last segment
-    finalize_segment(seg_start, len(seconds)-1, cumulative_ah)
+            # Detect sign change → end of event
+            if np.sign(current[i]) != np.sign(current[i-1]):
+                finalize_segment(seg_start, i-1, cumulative_ah)
+                seg_start = i
+                cumulative_ah = 0.0
+
+        # finalize last segment
+        finalize_segment(seg_start, len(seconds)-1, cumulative_ah)
+    else:
+        # Bypass → treat entire data as one segment
+        charge_segments = [(0, len(seconds)-1)]
+        discharge_segments = [(0, len(seconds)-1)]
 
     # -----------------------------
     # Helper: apply remaining filters
@@ -64,68 +75,84 @@ def detect_relaxation_after_throughput(
         seg_time = seconds[s:e+1]
         seg_current = current[s:e+1]
 
-        # --- CURRENT FILTER ---
-        current_threshold = c_rate_threshold * capacity_ah
-        relax_mask = np.abs(seg_current) < current_threshold
+        # ---------------- CURRENT FILTER ----------------
+        if apply_current_filter:
+            current_threshold = c_rate_threshold * capacity_ah
+            relax_mask = np.abs(seg_current) < current_threshold
 
-        # find subsegments
-        subsegments = []
-        start = None
-        for i, val in enumerate(relax_mask):
-            if val and start is None:
-                start = i
-            elif not val and start is not None:
-                subsegments.append((start, i-1))
-                start = None
-        if start is not None:
-            subsegments.append((start, len(relax_mask)-1))
+            subsegments = []
+            start = None
 
-        # --- PEAK FILTER ---
-        if peak_current_threshold is None:
-            peak_thr = current_threshold * 3
+            for i, val in enumerate(relax_mask):
+                if val and start is None:
+                    start = i
+                elif not val and start is not None:
+                    subsegments.append((start, i-1))
+                    start = None
+
+            if start is not None:
+                subsegments.append((start, len(relax_mask)-1))
+
         else:
-            peak_thr = peak_current_threshold
+            # Bypass → whole segment is candidate
+            subsegments = [(0, len(seg_current)-1)]
 
-        peak_filtered = []
-        for (ss, ee) in subsegments:
-            sub_i = np.abs(seg_current[ss:ee+1])
-            sub_t = seg_time[ss:ee+1]
+        # ---------------- PEAK FILTER ----------------
+        if apply_peak_filter:
+            if peak_current_threshold is None:
+                peak_thr = c_rate_threshold * capacity_ah * 3
+            else:
+                peak_thr = peak_current_threshold
 
-            peak_mask = sub_i > peak_thr
+            peak_filtered = []
 
-            peak_start = None
-            reject = False
+            for (ss, ee) in subsegments:
+                sub_i = np.abs(seg_current[ss:ee+1])
+                sub_t = seg_time[ss:ee+1]
 
-            for k, val in enumerate(peak_mask):
-                if val and peak_start is None:
-                    peak_start = k
-                elif not val and peak_start is not None:
-                    duration = sub_t[k-1] - sub_t[peak_start]
+                peak_mask = sub_i > peak_thr
+
+                peak_start = None
+                reject = False
+
+                for k, val in enumerate(peak_mask):
+                    if val and peak_start is None:
+                        peak_start = k
+                    elif not val and peak_start is not None:
+                        duration = sub_t[k-1] - sub_t[peak_start]
+                        if duration >= peak_duration_threshold:
+                            reject = True
+                            break
+                        peak_start = None
+
+                if peak_start is not None:
+                    duration = sub_t[-1] - sub_t[peak_start]
                     if duration >= peak_duration_threshold:
                         reject = True
-                        break
-                    peak_start = None
 
-            if peak_start is not None:
-                duration = sub_t[-1] - sub_t[peak_start]
-                if duration >= peak_duration_threshold:
-                    reject = True
+                if not reject:
+                    peak_filtered.append((ss, ee))
 
-            if not reject:
-                peak_filtered.append((ss, ee))
+        else:
+            peak_filtered = subsegments
 
-        # --- DURATION FILTER ---
-        final = []
-        for (ss, ee) in peak_filtered:
-            duration = seg_time[ee] - seg_time[ss]
-            if duration >= min_duration:
-                final.append((seconds[s + ss], seconds[s + ee]))
+        # ---------------- DURATION FILTER ----------------
+        final_segments = []
 
-        return final
+        if apply_duration_filter:
+            for (ss, ee) in peak_filtered:
+                duration = seg_time[ee] - seg_time[ss]
+                if duration >= min_duration:
+                    final_segments.append((ss, ee))
+        else:
+            final_segments = peak_filtered
 
-    # -----------------------------
-    # 2–4. Apply filters per segment
-    # -----------------------------
+        # Convert to absolute time
+        return [(seconds[s + ss], seconds[s + ee]) for (ss, ee) in final_segments]
+
+    # -------------------------------------------------
+    # Apply pipeline
+    # -------------------------------------------------
     charge_relaxations = []
     discharge_relaxations = []
 
