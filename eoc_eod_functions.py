@@ -31,7 +31,7 @@ def load_and_operate(folder_path, start_year, end_year, cellID, month = None, pr
                 
                 if operation:
                     result = operation(df)
-                    results = result
+                    results[f"{year}_{month:02d}"] = result
 
                 # print(f"Loaded: {file_name}")
 
