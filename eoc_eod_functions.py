@@ -30,7 +30,7 @@ def load_and_operate(folder_path, start_year, end_year, cellID, month = None, pr
                 df = process_time(df)
                 
                 if operation:
-                    result = operation(df)
+                    result = operation
                     results[f"{year}_{month:02d}"] = result
 
                 # print(f"Loaded: {file_name}")
@@ -53,7 +53,7 @@ def load_and_operate(folder_path, start_year, end_year, cellID, month = None, pr
                     df = process_time(df)
                     
                     if operation:
-                        result = operation(df)
+                        result = operation
                         results[f"{year}_{month:02d}"] = result
 
                     # print(f"Loaded: {file_name}")

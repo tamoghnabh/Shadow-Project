@@ -214,6 +214,8 @@ def vmax_vmin(df):
 def compute_ah_throughput(
     df,
     time_col="Seconds",
+    start_time=None,
+    end_time=None,
     current_col="I_cell_in_A",
     method="trapezoidal"
 ):
@@ -240,8 +242,8 @@ def compute_ah_throughput(
 
     # Sort just in case
     df = df.sort_values(time_col)
-    
-    _, _, start_time, end_time = vmax_vmin(df)
+    if start_time is None or end_time is None:
+        _, _, start_time, end_time = vmax_vmin(df)
     # Filter time window
     # Detect direction
     reverse = end_time < start_time
@@ -272,3 +274,144 @@ def compute_ah_throughput(
         raise ValueError("method must be 'trapezoidal' or 'rectangular'")
 
     return np.abs(ah)
+
+# --------------------------------------------------
+# 1. DCIR ESTIMATION FUNCTION
+# --------------------------------------------------
+def estimate_dcir(year: int, month: int) -> float:
+    start_year, start_month = 2016, 1
+    end_year, end_month = 2022, 12
+
+    dcir_start = 10e-3  # 10 mΩ
+    dcir_end = 40e-3    # 40 mΩ
+
+    def to_month_index(y, m):
+        return y * 12 + (m - 1)
+
+    t_start = to_month_index(start_year, start_month)
+    t_end = to_month_index(end_year, end_month)
+    t = to_month_index(year, month)
+
+    if t <= t_start:
+        return dcir_start
+    if t >= t_end:
+        return dcir_end
+
+    alpha = (t - t_start) / (t_end - t_start)
+
+    # Optional nonlinear aging (uncomment if needed)
+    # alpha = alpha**1.5
+
+    return dcir_start + alpha * (dcir_end - dcir_start)
+
+
+# --------------------------------------------------
+# 2. MAIN PIPELINE FUNCTION
+# --------------------------------------------------
+def detect_soc_window_segments(
+    df: pd.DataFrame,
+    year: int,
+    month: int,
+    voltage_col: str = "V_cell_in_V",
+    current_col: str = "I_cell_in_A",
+    time_col: str = "Seconds",
+    upper_bounds=(3.95, 4.05),
+    lower_bounds=(3.55, 3.65),
+    min_segment_length: int = 5,
+    seed: int = None,
+):
+    """
+    Full pipeline:
+    - Estimate DCIR
+    - Compute pseudo-OCV
+    - Detect upper/lower SOC segments
+
+    Returns:
+        dict with:
+            {
+                "upper_segments": [(t_start, t_end), ...],
+                "lower_segments": [(t_start, t_end), ...],
+                "dcir": value used,
+                "upper_threshold": value,
+                "lower_threshold": value
+            }
+    """
+
+    # -------------------------------
+    # 1. Estimate DCIR
+    # -------------------------------
+    R = estimate_dcir(year, month)
+
+    # -------------------------------
+    # 2. Compute pseudo-OCV
+    # -------------------------------
+    V = df[voltage_col].values
+    I = df[current_col].values
+    t = df[time_col].values
+
+    # V_ocv = V_terminal + I * R
+    V_ocv = V + I * R
+
+    # -------------------------------
+    # 3. Random threshold sampling
+    # -------------------------------
+    rng = np.random.default_rng(seed)
+
+    upper_thresh = rng.uniform(*upper_bounds)
+    lower_thresh = rng.uniform(*lower_bounds)
+
+    if lower_thresh >= upper_thresh:
+        raise ValueError("Invalid thresholds")
+
+    # -------------------------------
+    # 4. Create masks
+    # -------------------------------
+    upper_mask = V_ocv >= upper_thresh
+    lower_mask = V_ocv <= lower_thresh
+
+    # -------------------------------
+    # 5. Helper to extract segments
+    # -------------------------------
+    def extract_segments(mask):
+        segments = []
+        in_segment = False
+        start_idx = None
+
+        for i in range(len(mask)):
+            if mask[i]:
+                if not in_segment:
+                    in_segment = True
+                    start_idx = i
+            else:
+                if in_segment:
+                    end_idx = i - 1
+
+                    if (end_idx - start_idx + 1) >= min_segment_length:
+                        segments.append((t[start_idx], t[end_idx]))
+
+                    in_segment = False
+
+        # Handle tail case
+        if in_segment:
+            end_idx = len(mask) - 1
+            if (end_idx - start_idx + 1) >= min_segment_length:
+                segments.append((t[start_idx], t[end_idx]))
+
+        return segments
+
+    # -------------------------------
+    # 6. Extract segments
+    # -------------------------------
+    upper_segments = extract_segments(upper_mask)
+    lower_segments = extract_segments(lower_mask)
+
+    # -------------------------------
+    # 7. Return structured output
+    # -------------------------------
+    return {
+        "upper_segments": upper_segments,
+        "lower_segments": lower_segments,
+        "dcir": R,
+        "upper_threshold": upper_thresh,
+        "lower_threshold": lower_thresh,
+    }
