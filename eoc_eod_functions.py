@@ -18,19 +18,24 @@ def load_and_operate(folder_path, start_year, end_year, cellID, month = None, pr
     Returns:
     - dict, keys are 'YYYY_MM' or 'YYYY' (if month is None), values are results of the operation or the DataFrame itself if operation is None
     """
+    
     for year in range(start_year, end_year + 1):
         if month is not None:
-            file_name = f"{year}_{month:02d}_System_ID_{cellID}.csv"
+            file_name = f"{year}_{month:02d}_System_ID_{cellID:02d}.csv"
             file_path = os.path.join(folder_path, file_name)
 
             try:
                 df = pd.read_csv(file_path)
+                context_dict = {'df': df, 'year': year, 'month': month, 'cellID': cellID}
                 
                 df = process_time(df)
                 
                 if operation:
-                    result = operation(df)
-                    results = result
+                    for op in operation:
+                        op_result = op(context_dict)
+                        
+                    result = operation
+                    results[f"{year}_{month:02d}"] = result
 
                 # print(f"Loaded: {file_name}")
 
@@ -44,16 +49,15 @@ def load_and_operate(folder_path, start_year, end_year, cellID, month = None, pr
                 continue
         else:
             for month in range(1, 13):
-                file_name = f"{year}_{month:02d}_System_ID_{cellID}.csv"
+                file_name = f"{year}_{month:02d}_System_ID_{cellID:02d}.csv"
                 file_path = os.path.join(folder_path, file_name)
 
                 try:
                     df = pd.read_csv(file_path)
-                    
                     df = process_time(df)
                     
                     if operation:
-                        result = operation(df)
+                        result = operation
                         results[f"{year}_{month:02d}"] = result
 
                     # print(f"Loaded: {file_name}")
@@ -66,13 +70,13 @@ def load_and_operate(folder_path, start_year, end_year, cellID, month = None, pr
                 except Exception as e:
                     print(f"Error reading {file_name}: {e}")
                     continue
-
+    print(year ,month)
     return results
 
 def process_time(df):
     df['Time'] = pd.to_datetime(df['Time'])
-    timegap = (df['Time'] - df['Time'].iloc[0])
-    seconds = timegap.apply(lambda x: pd.Timedelta(x).total_seconds())
+    time_delta = (df['Time'] - df['Time'].iloc[0])
+    seconds = time_delta.dt.total_seconds()
     df['Seconds'] = seconds
     return df
 
@@ -183,3 +187,35 @@ def cell_level_info(systems_metadata, cell_id):
     V_nom = cell['Voltage_nominal_in_V'].iloc[0] / n_s
     Cell_ah = cell['Capacity_nominal_in_Ah'].iloc[0] / n_p
     return V_nom, Cell_ah
+
+def dict_to_df(data_dict, columns=None, index_name='key'):
+    """Convert a dict of values to a DataFrame.
+
+    Parameters
+    ----------
+    data_dict : dict
+        Mapping from key to values (tuple or dict).
+    columns : list[str] | None
+        Optional column names. If None, uses dict keys or auto-generates names.
+    index_name : str
+        Name for the index column. Default is 'key'.
+
+    Returns
+    -------
+    pd.DataFrame
+        Rows are the dict keys and columns are the values.
+    """
+    if len(data_dict) == 0:
+        return pd.DataFrame(columns=columns)
+
+    first_value = next(iter(data_dict.values()))
+    
+    if isinstance(first_value, dict):
+        df = pd.DataFrame.from_dict(data_dict, orient='index')
+        if columns is not None and list(df.columns) != columns:
+            df = df.reindex(columns=columns)
+    else:
+        df = pd.DataFrame.from_dict(data_dict, orient='index', columns=columns)
+
+    df.index.name = index_name
+    return df

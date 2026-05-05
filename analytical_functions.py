@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from scipy.signal import find_peaks
 
 def detect_relaxation_after_throughput(
     df,
@@ -203,3 +204,235 @@ def coulomb_count_bidirectional(
         soc = np.clip(soc, 0.0, 1.0)
 
     return soc
+
+def vmax_vmin(df):
+    max_V = df['V_cell_in_V'].max()
+    min_V = df['V_cell_in_V'].min()
+    max_V_time = df[df['V_cell_in_V'] == max_V]['Seconds'].iloc[0]
+    min_V_time = df[df['V_cell_in_V'] == min_V]['Seconds'].iloc[0]
+    return max_V, min_V, max_V_time, min_V_time
+
+def compute_ah_throughput(
+    df,
+    time_col="Seconds",
+    start_time=None,
+    end_time=None,
+    current_col="I_cell_in_A",
+    method="trapezoidal"
+):
+    """
+    Compute cumulative Ah throughput between two timestamps.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain time and current columns
+    start_time : float or datetime-like
+    end_time : float or datetime-like
+    time_col : str
+        Name of time column
+    current_col : str
+        Name of current column (A)
+    method : str
+        'trapezoidal' (recommended) or 'rectangular'
+
+    Returns
+    -------
+    throughput_ah : float
+    """
+
+    # Sort just in case
+    df = df.sort_values(time_col)
+    if start_time is None or end_time is None:
+        _, _, start_time, end_time = vmax_vmin(df)
+    # Filter time window
+    # Detect direction
+    reverse = end_time < start_time
+
+    t1, t2 = (end_time, start_time) if reverse else (start_time, end_time)
+
+    mask = (df[time_col] >= t1) & (df[time_col] <= t2)
+    sub_df = df.loc[mask]
+
+    if len(sub_df) < 2:
+        raise ValueError("Not enough data points in the selected interval")
+
+    t = sub_df[time_col].values
+    i = sub_df[current_col].values
+
+    # Compute dt
+    dt = np.diff(t)
+
+    if method == "rectangular":
+        # Left Riemann sum
+        ah = np.sum(i[:-1] * dt) / 3600.0
+
+    elif method == "trapezoidal":
+        # Better accuracy
+        ah = np.sum(0.5 * (i[:-1] + i[1:]) * dt) / 3600.0
+
+    else:
+        raise ValueError("method must be 'trapezoidal' or 'rectangular'")
+
+    return np.abs(ah)
+
+# --------------------------------------------------
+# 1. DCIR ESTIMATION FUNCTION
+# --------------------------------------------------
+def estimate_dcir(year: int, month: int) -> float:
+    start_year, start_month = 2016, 1
+    end_year, end_month = 2022, 12
+
+    dcir_start = 10e-3  # 10 mΩ
+    dcir_end = 40e-3    # 40 mΩ
+
+    def to_month_index(y, m):
+        return y * 12 + (m - 1)
+
+    t_start = to_month_index(start_year, start_month)
+    t_end = to_month_index(end_year, end_month)
+    t = to_month_index(year, month)
+
+    if t <= t_start:
+        return dcir_start
+    if t >= t_end:
+        return dcir_end
+
+    alpha = (t - t_start) / (t_end - t_start)
+
+    # Optional nonlinear aging (uncomment if needed)
+    # alpha = alpha**1.5
+
+    return dcir_start + alpha * (dcir_end - dcir_start)
+
+
+
+## Second approach: Peak detection based
+def detect_voltage_peaks(time, voltage, v_high=4.0, v_low=3.4):
+    """
+    Detect high and low peaks in voltage data.
+
+    Parameters:
+    - time: np.array (N,)
+    - voltage: np.array (N,)
+    - v_high: threshold for high peaks
+    - v_low: threshold for low peaks
+
+    Returns:
+    - high_peaks: np.array (n, 2) -> [time, voltage]
+    - low_peaks: np.array (m, 2) -> [time, voltage]
+    """
+
+    # --- High peaks (local maxima) ---
+    peaks_high_idx, _ = find_peaks(voltage, distance=200, prominence=0.1)  # distance to avoid noise
+    peaks_high_idx = peaks_high_idx[voltage[peaks_high_idx] > v_high]
+
+    high_peaks = np.column_stack((
+        time[peaks_high_idx],
+        voltage[peaks_high_idx]
+    ))
+
+    # --- Low peaks (local minima) ---
+    peaks_low_idx, _ = find_peaks(-voltage, distance=200, prominence=0.1)  # distance to avoid noise
+    peaks_low_idx = peaks_low_idx[voltage[peaks_low_idx] < v_low]
+
+    low_peaks = np.column_stack((
+        time[peaks_low_idx],
+        voltage[peaks_low_idx]
+    ))
+
+    return high_peaks, low_peaks
+
+def pair_peaks(high_peaks, low_peaks):
+    """
+    Pair peaks based on time ordering.
+
+    Returns:
+    - high_to_low: (k, 2) -> [high_time, next_low_time]
+    - low_to_high: (l, 2) -> [low_time, next_high_time]
+    """
+
+    high_t = high_peaks[:, 0]
+    low_t = low_peaks[:, 0]
+
+    # --- High -> next Low ---
+    idx_low = np.searchsorted(low_t, high_t, side='right')
+
+    valid_hl = idx_low < len(low_t)
+    high_to_low = np.column_stack((
+        high_t[valid_hl],
+        low_t[idx_low[valid_hl]]
+    ))
+
+    # --- Low -> next High ---
+    idx_high = np.searchsorted(high_t, low_t, side='right')
+
+    valid_lh = idx_high < len(high_t)
+    low_to_high = np.column_stack((
+        low_t[valid_lh],
+        high_t[idx_high[valid_lh]]
+    ))
+
+    return high_to_low, low_to_high
+
+
+def sample_segments_and_compute_throughput(df, peak_pairs,
+                                           v_high_range=(3.95, 4.05),
+                                           v_low_range=(3.55, 3.65),
+                                           voltage_col='V_cell_in_V',
+                                           time_col='Seconds'):
+    """
+    df: full dataframe with time + voltage
+    peak_pairs: (N, 2) array -> [start_ts, end_ts] (from your pairing function)
+    throughput_fn: function(t_start, t_end)
+
+    Returns:
+    - results: list of dicts with thresholds, timestamps, throughput
+    """
+
+    time = df[time_col].values
+    voltage = df[voltage_col].values
+
+    results = []
+
+    for (t_start_guess, t_end_guess) in peak_pairs:
+
+        # --- Random thresholds ---
+        v_high = np.random.uniform(*v_high_range)
+        v_low = np.random.uniform(*v_low_range)
+
+        # --- Mask segment between given timestamps ---
+        mask = (time >= t_start_guess) & (time <= t_end_guess)
+        if not np.any(mask):
+            continue
+
+        t_seg = time[mask]
+        v_seg = voltage[mask]
+
+        # --- Find high crossing (first time going below v_high) ---
+        high_cross_idx = np.where(v_seg <= v_high)[0]
+        if len(high_cross_idx) == 0:
+            continue
+        i_start = high_cross_idx[0]
+
+        # --- Find low crossing AFTER high crossing ---
+        low_cross_idx = np.where(v_seg[i_start:] <= v_low)[0]
+        if len(low_cross_idx) == 0:
+            continue
+        i_end = i_start + low_cross_idx[0]
+
+        t1 = t_seg[i_start]
+        t2 = t_seg[i_end]
+
+        # --- Throughput ---
+        ah = compute_ah_throughput(df, start_time=t1, end_time=t2)
+
+        results.append({
+            't_start': t1,
+            't_end': t2,
+            'v_high': v_high,
+            'v_low': v_low,
+            'throughput_ah': ah
+        })
+
+    return results
