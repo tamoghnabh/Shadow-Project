@@ -26,10 +26,14 @@ def load_and_operate(folder_path, start_year, end_year, cellID, month = None, pr
 
             try:
                 df = pd.read_csv(file_path)
+                context_dict = {'df': df, 'year': year, 'month': month, 'cellID': cellID}
                 
                 df = process_time(df)
                 
                 if operation:
+                    for op in operation:
+                        op_result = op(context_dict)
+                        
                     result = operation
                     results[f"{year}_{month:02d}"] = result
 

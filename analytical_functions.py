@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from scipy.signal import find_peaks
 
 def detect_relaxation_after_throughput(
     df,
@@ -305,113 +306,133 @@ def estimate_dcir(year: int, month: int) -> float:
     return dcir_start + alpha * (dcir_end - dcir_start)
 
 
-# --------------------------------------------------
-# 2. MAIN PIPELINE FUNCTION
-# --------------------------------------------------
-def detect_soc_window_segments(
-    df: pd.DataFrame,
-    year: int,
-    month: int,
-    voltage_col: str = "V_cell_in_V",
-    current_col: str = "I_cell_in_A",
-    time_col: str = "Seconds",
-    upper_bounds=(3.95, 4.05),
-    lower_bounds=(3.55, 3.65),
-    min_segment_length: int = 5,
-    seed: int = None,
-):
+
+## Second approach: Peak detection based
+def detect_voltage_peaks(time, voltage, v_high=4.0, v_low=3.4):
     """
-    Full pipeline:
-    - Estimate DCIR
-    - Compute pseudo-OCV
-    - Detect upper/lower SOC segments
+    Detect high and low peaks in voltage data.
+
+    Parameters:
+    - time: np.array (N,)
+    - voltage: np.array (N,)
+    - v_high: threshold for high peaks
+    - v_low: threshold for low peaks
 
     Returns:
-        dict with:
-            {
-                "upper_segments": [(t_start, t_end), ...],
-                "lower_segments": [(t_start, t_end), ...],
-                "dcir": value used,
-                "upper_threshold": value,
-                "lower_threshold": value
-            }
+    - high_peaks: np.array (n, 2) -> [time, voltage]
+    - low_peaks: np.array (m, 2) -> [time, voltage]
     """
 
-    # -------------------------------
-    # 1. Estimate DCIR
-    # -------------------------------
-    R = estimate_dcir(year, month)
+    # --- High peaks (local maxima) ---
+    peaks_high_idx, _ = find_peaks(voltage, distance=200, prominence=0.1)  # distance to avoid noise
+    peaks_high_idx = peaks_high_idx[voltage[peaks_high_idx] > v_high]
 
-    # -------------------------------
-    # 2. Compute pseudo-OCV
-    # -------------------------------
-    V = df[voltage_col].values
-    I = df[current_col].values
-    t = df[time_col].values
+    high_peaks = np.column_stack((
+        time[peaks_high_idx],
+        voltage[peaks_high_idx]
+    ))
 
-    # V_ocv = V_terminal + I * R
-    V_ocv = V + I * R
+    # --- Low peaks (local minima) ---
+    peaks_low_idx, _ = find_peaks(-voltage, distance=200, prominence=0.1)  # distance to avoid noise
+    peaks_low_idx = peaks_low_idx[voltage[peaks_low_idx] < v_low]
 
-    # -------------------------------
-    # 3. Random threshold sampling
-    # -------------------------------
-    rng = np.random.default_rng(seed)
+    low_peaks = np.column_stack((
+        time[peaks_low_idx],
+        voltage[peaks_low_idx]
+    ))
 
-    upper_thresh = rng.uniform(*upper_bounds)
-    lower_thresh = rng.uniform(*lower_bounds)
+    return high_peaks, low_peaks
 
-    if lower_thresh >= upper_thresh:
-        raise ValueError("Invalid thresholds")
+def pair_peaks(high_peaks, low_peaks):
+    """
+    Pair peaks based on time ordering.
 
-    # -------------------------------
-    # 4. Create masks
-    # -------------------------------
-    upper_mask = V_ocv >= upper_thresh
-    lower_mask = V_ocv <= lower_thresh
+    Returns:
+    - high_to_low: (k, 2) -> [high_time, next_low_time]
+    - low_to_high: (l, 2) -> [low_time, next_high_time]
+    """
 
-    # -------------------------------
-    # 5. Helper to extract segments
-    # -------------------------------
-    def extract_segments(mask):
-        segments = []
-        in_segment = False
-        start_idx = None
+    high_t = high_peaks[:, 0]
+    low_t = low_peaks[:, 0]
 
-        for i in range(len(mask)):
-            if mask[i]:
-                if not in_segment:
-                    in_segment = True
-                    start_idx = i
-            else:
-                if in_segment:
-                    end_idx = i - 1
+    # --- High -> next Low ---
+    idx_low = np.searchsorted(low_t, high_t, side='right')
 
-                    if (end_idx - start_idx + 1) >= min_segment_length:
-                        segments.append((t[start_idx], t[end_idx]))
+    valid_hl = idx_low < len(low_t)
+    high_to_low = np.column_stack((
+        high_t[valid_hl],
+        low_t[idx_low[valid_hl]]
+    ))
 
-                    in_segment = False
+    # --- Low -> next High ---
+    idx_high = np.searchsorted(high_t, low_t, side='right')
 
-        # Handle tail case
-        if in_segment:
-            end_idx = len(mask) - 1
-            if (end_idx - start_idx + 1) >= min_segment_length:
-                segments.append((t[start_idx], t[end_idx]))
+    valid_lh = idx_high < len(high_t)
+    low_to_high = np.column_stack((
+        low_t[valid_lh],
+        high_t[idx_high[valid_lh]]
+    ))
 
-        return segments
+    return high_to_low, low_to_high
 
-    # -------------------------------
-    # 6. Extract segments
-    # -------------------------------
-    upper_segments = extract_segments(upper_mask)
-    lower_segments = extract_segments(lower_mask)
 
-    # -------------------------------
-    # 7. Return structured output
-    # -------------------------------
-    return {
-        "upper_segments": upper_segments,
-        "lower_segments": lower_segments,
-        "dcir": R,
-        "upper_threshold": upper_thresh,
-        "lower_threshold": lower_thresh,
-    }
+def sample_segments_and_compute_throughput(df, peak_pairs,
+                                           v_high_range=(3.95, 4.05),
+                                           v_low_range=(3.55, 3.65),
+                                           voltage_col='V_cell_in_V',
+                                           time_col='Seconds'):
+    """
+    df: full dataframe with time + voltage
+    peak_pairs: (N, 2) array -> [start_ts, end_ts] (from your pairing function)
+    throughput_fn: function(t_start, t_end)
+
+    Returns:
+    - results: list of dicts with thresholds, timestamps, throughput
+    """
+
+    time = df[time_col].values
+    voltage = df[voltage_col].values
+
+    results = []
+
+    for (t_start_guess, t_end_guess) in peak_pairs:
+
+        # --- Random thresholds ---
+        v_high = np.random.uniform(*v_high_range)
+        v_low = np.random.uniform(*v_low_range)
+
+        # --- Mask segment between given timestamps ---
+        mask = (time >= t_start_guess) & (time <= t_end_guess)
+        if not np.any(mask):
+            continue
+
+        t_seg = time[mask]
+        v_seg = voltage[mask]
+
+        # --- Find high crossing (first time going below v_high) ---
+        high_cross_idx = np.where(v_seg <= v_high)[0]
+        if len(high_cross_idx) == 0:
+            continue
+        i_start = high_cross_idx[0]
+
+        # --- Find low crossing AFTER high crossing ---
+        low_cross_idx = np.where(v_seg[i_start:] <= v_low)[0]
+        if len(low_cross_idx) == 0:
+            continue
+        i_end = i_start + low_cross_idx[0]
+
+        t1 = t_seg[i_start]
+        t2 = t_seg[i_end]
+
+        # --- Throughput ---
+        ah = compute_ah_throughput(df, start_time=t1, end_time=t2)
+
+        results.append({
+            't_start': t1,
+            't_end': t2,
+            'v_high': v_high,
+            'v_low': v_low,
+            'throughput_ah': ah
+        })
+
+    return results
